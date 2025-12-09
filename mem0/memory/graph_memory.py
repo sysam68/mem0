@@ -1,3 +1,4 @@
+import json
 import logging
 
 from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
@@ -211,12 +212,34 @@ class MemoryGraph:
 
         entity_type_map = {}
 
+        # Some providers might return plain text if tool calling isn't supported
+        if not isinstance(search_results, dict):
+            logger.debug(f"Search results without tool calls, skipping graph extraction: {search_results}")
+            return {}
+
         try:
-            for tool_call in search_results["tool_calls"]:
-                if tool_call["name"] != "extract_entities":
+            for tool_call in search_results.get("tool_calls", []):
+                if tool_call.get("name") != "extract_entities":
                     continue
-                for item in tool_call["arguments"]["entities"]:
-                    entity_type_map[item["entity"]] = item["entity_type"]
+                args = self._parse_tool_arguments(tool_call)
+                entities = args.get("entities", [])
+                if isinstance(entities, str):
+                    try:
+                        entities = json.loads(entities)
+                    except Exception:
+                        entities = []
+                for item in entities:
+                    if isinstance(item, str):
+                        try:
+                            item = json.loads(item)
+                        except Exception:
+                            continue
+                    if not isinstance(item, dict):
+                        continue
+                    entity_name = item.get("entity") or item.get("name")
+                    entity_type = item.get("entity_type") or item.get("type")
+                    if entity_name and entity_type:
+                        entity_type_map[entity_name] = entity_type
         except Exception as e:
             logger.exception(
                 f"Error in search tool: {e}, llm_provider={self.llm_provider}, search_results={search_results}"
@@ -260,9 +283,22 @@ class MemoryGraph:
             tools=_tools,
         )
 
+        if not isinstance(extracted_entities, dict):
+            logger.debug(f"Relations response without tool calls, skipping graph extraction: {extracted_entities}")
+            return []
+
         entities = []
-        if extracted_entities.get("tool_calls"):
-            entities = extracted_entities["tool_calls"][0].get("arguments", {}).get("entities", [])
+        for tc in extracted_entities.get("tool_calls", []):
+            if tc.get("name") != "establish_relationships":
+                continue
+            args = self._parse_tool_arguments(tc)
+            rels = args.get("entities") or args.get("relations") or []
+            if isinstance(rels, str):
+                try:
+                    rels = json.loads(rels)
+                except Exception:
+                    rels = []
+            entities.extend(rels)
 
         entities = self._remove_spaces_from_entities(entities)
         logger.debug(f"Extracted entities: {entities}")
@@ -347,9 +383,10 @@ class MemoryGraph:
         )
 
         to_be_deleted = []
-        for item in memory_updates.get("tool_calls", []):
-            if item.get("name") == "delete_graph_memory":
-                to_be_deleted.append(item.get("arguments"))
+        if isinstance(memory_updates, dict):
+            for item in memory_updates.get("tool_calls", []):
+                if item.get("name") == "delete_graph_memory":
+                    to_be_deleted.append(item.get("arguments"))
         # Clean entities formatting
         to_be_deleted = self._remove_spaces_from_entities(to_be_deleted)
         logger.debug(f"Deleted relationships: {to_be_deleted}")
@@ -606,13 +643,50 @@ class MemoryGraph:
             results.append(result)
         return results
 
+    def _parse_tool_arguments(self, tool_call):
+        """Normalize tool call arguments across providers."""
+        args = tool_call.get("arguments")
+        if args is None and tool_call.get("function"):
+            args = tool_call["function"].get("arguments")
+
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                # Leave as-is if it is not valid JSON
+                pass
+
+        if isinstance(args, dict):
+            for key in ("entities", "relations", "relationships"):
+                value = args.get(key)
+                if isinstance(value, str):
+                    try:
+                        args[key] = json.loads(value)
+                    except Exception:
+                        # Ignore parsing errors; caller will handle types
+                        pass
+
+        return args or {}
+
     def _remove_spaces_from_entities(self, entity_list):
+        cleaned = []
         for item in entity_list:
+            # Skip non-dict entries
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except Exception:
+                    continue
+            if not isinstance(item, dict):
+                continue
+            if not all(k in item for k in ("source", "relationship", "destination")):
+                continue
             item["source"] = item["source"].lower().replace(" ", "_")
             # Use the sanitization function for relationships to handle special characters
             item["relationship"] = sanitize_relationship_for_cypher(item["relationship"].lower().replace(" ", "_"))
             item["destination"] = item["destination"].lower().replace(" ", "_")
-        return entity_list
+            cleaned.append(item)
+        return cleaned
 
     def _search_source_node(self, source_embedding, filters, threshold=0.9):
         # Build WHERE conditions
